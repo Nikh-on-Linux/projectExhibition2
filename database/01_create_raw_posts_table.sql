@@ -3,6 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS raw_posts (
     id SERIAL PRIMARY KEY,
+    batch_id VARCHAR(255) NOT NULL,
     platform VARCHAR(50) NOT NULL,
     keyword VARCHAR(255),
     raw_text TEXT NOT NULL,
@@ -12,6 +13,7 @@ CREATE TABLE IF NOT EXISTS raw_posts (
 );
 
 -- Create index for faster queries
+CREATE INDEX idx_raw_posts_batch_id ON raw_posts(batch_id);
 CREATE INDEX idx_raw_posts_platform ON raw_posts(platform);
 CREATE INDEX idx_raw_posts_keyword ON raw_posts(keyword);
 CREATE INDEX idx_raw_posts_created_at ON raw_posts(created_at);

@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS enriched_posts (
     id SERIAL PRIMARY KEY,
     cleaned_post_id INT NOT NULL,
+    batch_id VARCHAR(255) NOT NULL,
     emotion_label VARCHAR(50),
     confidence DECIMAL(3, 2),
     emotion_intensity DECIMAL(3, 2),
@@ -13,6 +14,7 @@ CREATE TABLE IF NOT EXISTS enriched_posts (
 );
 
 -- Create indexes for faster queries
+CREATE INDEX idx_enriched_posts_batch_id ON enriched_posts(batch_id);
 CREATE INDEX idx_enriched_posts_cleaned_post_id ON enriched_posts(cleaned_post_id);
 CREATE INDEX idx_enriched_posts_emotion_label ON enriched_posts(emotion_label);
 CREATE INDEX idx_enriched_posts_analyzed_at ON enriched_posts(analyzed_at);

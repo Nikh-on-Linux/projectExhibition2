@@ -1,0 +1,11 @@
+fastapi[standard]
+uvicorn
+sqlalchemy[asyncio]
+asyncpg
+transformers
+torch
+python-dotenv
+pydantic
+pytest
+pytest-asyncio
+httpx

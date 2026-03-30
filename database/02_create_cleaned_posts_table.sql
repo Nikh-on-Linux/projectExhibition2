@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS cleaned_posts (
     id SERIAL PRIMARY KEY,
     raw_post_id INT NOT NULL,
+    batch_id VARCHAR(255) NOT NULL,
     cleaned_text TEXT NOT NULL,
     language VARCHAR(50),
     emoji_converted BOOLEAN DEFAULT FALSE,
@@ -12,6 +13,7 @@ CREATE TABLE IF NOT EXISTS cleaned_posts (
 );
 
 -- Create indexes for faster queries
+CREATE INDEX idx_cleaned_posts_batch_id ON cleaned_posts(batch_id);
 CREATE INDEX idx_cleaned_posts_raw_post_id ON cleaned_posts(raw_post_id);
 CREATE INDEX idx_cleaned_posts_language ON cleaned_posts(language);
 CREATE INDEX idx_cleaned_posts_processed_at ON cleaned_posts(processed_at);
