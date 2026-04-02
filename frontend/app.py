@@ -1,21 +1,30 @@
 import html
 import os
-from datetime import datetime, timedelta
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List
 
 import pandas as pd
 import plotly.graph_objects as go
+import psycopg
 import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="PulseGrid | Emotion Ops",
+    page_title="PulseGrid | Pipeline Control",
     page_icon=":zap:",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-API_BASE_URL = os.getenv("DASHBOARD_API_URL", "http://localhost:8000")
+CLEANING_BASE_URL = os.getenv("CLEANING_BASE_URL", "http://localhost:5000")
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://localhost:4000")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://emotion_app:emotion_password_123@localhost:5432/emotion_db",
+)
 
 EMOTION_COLORS = {
     "joy": "#00F5FF",
@@ -26,6 +35,17 @@ EMOTION_COLORS = {
     "surprise": "#FFD60A",
     "neutral": "#8D99AE",
 }
+
+
+@dataclass
+class BatchAssignResult:
+    batch_id: str
+    matched_count: int
+    sample_rows: List[Dict[str, Any]]
+
+
+class PipelineError(Exception):
+    pass
 
 
 def inject_custom_css() -> None:
@@ -39,33 +59,24 @@ def inject_custom_css() -> None:
             --bg-1: #0f1729;
             --bg-2: #131f36;
             --panel: rgba(14, 21, 38, 0.82);
-            --panel-border: rgba(0, 245, 255, 0.25);
             --text-main: #e8eeff;
             --text-muted: #96a7d3;
             --accent: #00f5ff;
             --accent-2: #39ff14;
-            --danger: #ff2d55;
-            --warning: #ffd60a;
         }
 
         html, body, [data-testid="stAppViewContainer"] {
             background:
-                radial-gradient(circle at 12% 14%, rgba(0, 245, 255, 0.18), transparent 28%),
-                radial-gradient(circle at 88% 12%, rgba(57, 255, 20, 0.12), transparent 24%),
-                radial-gradient(circle at 50% 78%, rgba(255, 45, 85, 0.12), transparent 30%),
+                radial-gradient(circle at 12% 14%, rgba(0, 245, 255, 0.16), transparent 28%),
+                radial-gradient(circle at 88% 12%, rgba(57, 255, 20, 0.11), transparent 24%),
+                radial-gradient(circle at 50% 78%, rgba(255, 45, 85, 0.1), transparent 30%),
                 linear-gradient(160deg, var(--bg-0), var(--bg-1) 45%, var(--bg-2));
             color: var(--text-main);
             font-family: "Space Grotesk", "Segoe UI", sans-serif;
         }
 
         [data-testid="stHeader"] { background: transparent; }
-        [data-testid="stToolbar"] { right: 1rem; }
-
-        .block-container {
-            max-width: 1300px;
-            padding-top: 1.2rem;
-            padding-bottom: 2.25rem;
-        }
+        .block-container { max-width: 1320px; padding-top: 1rem; }
 
         .hero-shell {
             border: 1px solid rgba(0, 245, 255, 0.25);
@@ -73,26 +84,9 @@ def inject_custom_css() -> None:
             background:
                 linear-gradient(140deg, rgba(0, 245, 255, 0.08), rgba(0, 0, 0, 0.1) 40%, rgba(57, 255, 20, 0.06)),
                 rgba(7, 12, 24, 0.88);
-            box-shadow:
-                0 0 0 1px rgba(0, 245, 255, 0.06) inset,
-                0 18px 40px rgba(1, 8, 20, 0.55),
-                0 0 34px rgba(0, 245, 255, 0.14);
+            box-shadow: 0 18px 40px rgba(1, 8, 20, 0.55), 0 0 34px rgba(0, 245, 255, 0.14);
             padding: 1.4rem 1.6rem;
-            overflow: hidden;
-            position: relative;
-            animation: pulseIn 0.7s ease-out;
-        }
-
-        .hero-shell::after {
-            content: "";
-            position: absolute;
-            width: 260px;
-            height: 260px;
-            border-radius: 50%;
-            background: radial-gradient(circle, rgba(57, 255, 20, 0.18), transparent 65%);
-            right: -90px;
-            top: -90px;
-            pointer-events: none;
+            margin-bottom: 1rem;
         }
 
         .hero-topline {
@@ -106,100 +100,82 @@ def inject_custom_css() -> None:
 
         .hero-title {
             font-family: "Orbitron", sans-serif;
-            font-size: clamp(1.3rem, 2.1vw, 2rem);
-            letter-spacing: 0.03em;
+            font-size: clamp(1.2rem, 2vw, 1.9rem);
             margin: 0;
             color: #f4f8ff;
         }
 
         .hero-sub {
-            margin-top: 0.42rem;
+            margin-top: 0.45rem;
             color: var(--text-muted);
-            font-size: 0.96rem;
+            font-size: 0.95rem;
         }
 
         .status-grid {
-            margin-top: 1rem;
+            margin-top: 0.95rem;
             display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 0.85rem;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.8rem;
         }
 
         .status-chip {
             background: rgba(9, 17, 34, 0.88);
             border: 1px solid rgba(141, 153, 174, 0.2);
-            border-radius: 14px;
-            padding: 0.75rem 0.9rem;
+            border-radius: 13px;
+            padding: 0.72rem 0.85rem;
         }
 
         .chip-label {
             color: var(--text-muted);
-            font-size: 0.75rem;
+            font-size: 0.73rem;
             text-transform: uppercase;
             letter-spacing: 0.12em;
-            margin-bottom: 0.25rem;
+            margin-bottom: 0.22rem;
         }
 
         .chip-value {
             font-family: "Orbitron", sans-serif;
             color: #f7fbff;
-            font-size: 1.1rem;
-        }
-
-        .chip-platform {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.45rem;
-            font-weight: 700;
-            color: #ff7b39;
             font-size: 1rem;
-        }
-
-        .chip-platform .dot {
-            width: 9px;
-            height: 9px;
-            border-radius: 50%;
-            background: #ff7b39;
-            box-shadow: 0 0 16px rgba(255, 123, 57, 0.8);
-            display: inline-block;
+            word-break: break-word;
         }
 
         .panel {
             border: 1px solid rgba(0, 245, 255, 0.2);
-            border-radius: 18px;
+            border-radius: 16px;
             background: var(--panel);
             box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
             padding: 0.9rem 1rem 1rem;
-            animation: riseIn 0.6s ease-out;
+            margin-bottom: 1rem;
         }
 
         .panel-title {
-            margin: 0.15rem 0 0.7rem;
+            margin: 0.08rem 0 0.55rem;
             color: #f4f8ff;
             font-family: "Orbitron", sans-serif;
             letter-spacing: 0.05em;
-            font-size: 1rem;
+            font-size: 0.95rem;
         }
 
         .panel-subtitle {
-            margin-top: -0.4rem;
+            margin-top: -0.25rem;
             margin-bottom: 0.7rem;
             color: var(--text-muted);
             font-size: 0.84rem;
         }
 
         .table-shell {
-            margin-top: 0.4rem;
+            margin-top: 0.45rem;
             max-height: 540px;
             overflow: auto;
-            border-radius: 14px;
+            border-radius: 12px;
             border: 1px solid rgba(141, 153, 174, 0.22);
         }
 
         table.post-table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 0.88rem;
+            font-size: 0.86rem;
             background: rgba(8, 13, 24, 0.95);
         }
 
@@ -208,51 +184,31 @@ def inject_custom_css() -> None:
             top: 0;
             z-index: 2;
             text-align: left;
-            padding: 0.75rem;
+            padding: 0.7rem;
             background: rgba(11, 19, 34, 0.98);
             color: #9ab0dd;
-            font-size: 0.73rem;
+            font-size: 0.72rem;
             text-transform: uppercase;
             letter-spacing: 0.09em;
             border-bottom: 1px solid rgba(141, 153, 174, 0.24);
         }
 
         .post-table td {
-            padding: 0.68rem 0.75rem;
+            padding: 0.66rem 0.72rem;
             border-bottom: 1px solid rgba(141, 153, 174, 0.12);
             vertical-align: top;
             color: #dbe7ff;
         }
 
-        .post-table tr:hover {
-            background: rgba(22, 35, 58, 0.6);
-        }
-
-        .post-snippet {
-            max-width: 360px;
-            line-height: 1.36;
-            color: #ecf2ff;
-        }
-
-        .cleaned-snippet {
-            max-width: 370px;
-            color: #adc2ea;
-            line-height: 1.34;
-        }
-
         .emotion-pill {
             display: inline-block;
-            padding: 0.28rem 0.6rem;
+            padding: 0.27rem 0.6rem;
             border-radius: 999px;
             font-weight: 700;
             text-transform: capitalize;
             letter-spacing: 0.03em;
-            font-size: 0.78rem;
-            color: #0a0f18;
-        }
-
-        .conf-wrap {
-            min-width: 170px;
+            font-size: 0.76rem;
+            color: #08101b;
         }
 
         .conf-track {
@@ -261,6 +217,7 @@ def inject_custom_css() -> None:
             background: rgba(131, 148, 184, 0.24);
             overflow: hidden;
             margin-bottom: 0.32rem;
+            min-width: 130px;
         }
 
         .conf-fill {
@@ -269,40 +226,17 @@ def inject_custom_css() -> None:
             box-shadow: 0 0 10px rgba(0, 245, 255, 0.45);
         }
 
-        .conf-label {
-            color: #a8bbe0;
-            font-size: 0.79rem;
-        }
-
-        .small-note {
-            color: #8ea2cf;
-            font-size: 0.8rem;
-            margin-top: 0.55rem;
-        }
-
-        @keyframes pulseIn {
-            from { opacity: 0; transform: translateY(8px) scale(0.99); }
-            to { opacity: 1; transform: translateY(0) scale(1); }
-        }
-
-        @keyframes riseIn {
-            from { opacity: 0; transform: translateY(14px); }
-            to { opacity: 1; transform: translateY(0); }
+        .mono {
+            font-family: Consolas, monospace;
+            color: #8cd4ff;
         }
 
         @media (max-width: 980px) {
-            .status-grid {
-                grid-template-columns: 1fr;
-            }
+            .status-grid { grid-template-columns: 1fr 1fr; }
+        }
 
-            .post-snippet,
-            .cleaned-snippet {
-                max-width: 260px;
-            }
-
-            .block-container {
-                padding-top: 0.7rem;
-            }
+        @media (max-width: 620px) {
+            .status-grid { grid-template-columns: 1fr; }
         }
         </style>
         """,
@@ -310,143 +244,178 @@ def inject_custom_css() -> None:
     )
 
 
-def mock_overview_data() -> Dict[str, Any]:
-    now = datetime.now()
-    return {
-        "total_posts": 1842,
-        "platform_split": {"reddit": 1842},
-        "date_range": {
-            "start": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
-            "end": now.strftime("%Y-%m-%d"),
-        },
-    }
+def normalize_database_url(url: str) -> str:
+    if url.startswith("postgresql+asyncpg://"):
+        return url.replace("postgresql+asyncpg://", "postgresql://", 1)
+    return url
 
 
-def mock_emotions_data() -> Dict[str, Any]:
-    return {
-        "distribution": {
-            "joy": 372,
-            "anger": 214,
-            "fear": 177,
-            "disgust": 122,
-            "sadness": 313,
-            "surprise": 198,
-            "neutral": 446,
-        }
-    }
+def db_fetch_all(query: str, params: tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    conn_url = normalize_database_url(DATABASE_URL)
+    with psycopg.connect(conn_url) as conn:
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute(query, params)
+            return list(cur.fetchall())
 
 
-def mock_posts_data() -> Dict[str, Any]:
-    base_rows = [
-        {
-            "raw_text": "I finally got the internship offer after months of rejections and I cannot stop smiling.",
-            "cleaned_text": "finally got internship offer months rejection cannot stop smiling",
-            "emotion_label": "joy",
-            "confidence": 0.94,
-        },
-        {
-            "raw_text": "The policy change feels unfair and people are furious in the comments section.",
-            "cleaned_text": "policy change feels unfair people furious comments section",
-            "emotion_label": "anger",
-            "confidence": 0.88,
-        },
-        {
-            "raw_text": "The sudden layoffs have everyone worried about what happens next.",
-            "cleaned_text": "sudden layoffs everyone worried happens next",
-            "emotion_label": "fear",
-            "confidence": 0.85,
-        },
-        {
-            "raw_text": "The scam ad was all over the subreddit and it was honestly disgusting to see.",
-            "cleaned_text": "scam ad subreddit honestly disgusting see",
-            "emotion_label": "disgust",
-            "confidence": 0.83,
-        },
-        {
-            "raw_text": "I miss how the community used to be before all this drama started.",
-            "cleaned_text": "miss community used drama started",
-            "emotion_label": "sadness",
-            "confidence": 0.81,
-        },
-        {
-            "raw_text": "I opened the thread expecting bad news but the ending completely shocked me.",
-            "cleaned_text": "opened thread expecting bad news ending completely shocked",
-            "emotion_label": "surprise",
-            "confidence": 0.79,
-        },
-        {
-            "raw_text": "The update is out; looks stable so far and users are discussing minor improvements.",
-            "cleaned_text": "update out looks stable far users discussing minor improvements",
-            "emotion_label": "neutral",
-            "confidence": 0.76,
-        },
-    ]
-
-    rows: List[Dict[str, Any]] = []
-    for i in range(1, 43):
-        row = base_rows[i % len(base_rows)].copy()
-        row["id"] = i
-        row["platform"] = "reddit"
-        row["created_at"] = (datetime.now() - timedelta(hours=i * 4)).isoformat(timespec="seconds")
-        rows.append(row)
-
-    return {"posts": rows}
+def db_execute(query: str, params: tuple[Any, ...] = ()) -> int:
+    conn_url = normalize_database_url(DATABASE_URL)
+    with psycopg.connect(conn_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            affected = cur.rowcount
+        conn.commit()
+        return affected
 
 
-def fetch_json(endpoint: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
+def generate_batch_id(keyword: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", keyword.lower().strip()).strip("-") or "batch"
+    return f"frontend-{slug}-{int(time.time())}"
+
+
+def search_and_assign_batch(keyword: str, limit: int = 50) -> BatchAssignResult:
+    like_term = f"%{keyword}%"
+    rows = db_fetch_all(
+        """
+        SELECT id, platform, keyword, raw_text, batch_id, created_at
+        FROM raw_posts
+        WHERE keyword ILIKE %s OR raw_text ILIKE %s
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+        """,
+        (like_term, like_term, limit),
+    )
+    if not rows:
+        raise PipelineError(f"No raw_posts found for keyword: {keyword}")
+
+    new_batch_id = generate_batch_id(keyword)
+    row_ids = [int(r["id"]) for r in rows]
+
+    updated = db_execute(
+        "UPDATE raw_posts SET batch_id = %s WHERE id = ANY(%s)",
+        (new_batch_id, row_ids),
+    )
+    if updated <= 0:
+        raise PipelineError("Batch assignment failed: no rows were updated.")
+
+    return BatchAssignResult(
+        batch_id=new_batch_id,
+        matched_count=updated,
+        sample_rows=rows[:8],
+    )
+
+
+def call_json(method: str, url: str, timeout: int = 15) -> Dict[str, Any]:
     try:
-        response = requests.get(f"{API_BASE_URL}{endpoint}", timeout=2)
+        response = requests.request(method=method, url=url, timeout=timeout)
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict):
             return payload
-    except (requests.RequestException, ValueError):
-        pass
-    return fallback
+        return {"data": payload}
+    except requests.RequestException as exc:
+        raise PipelineError(f"Request failed for {url}: {exc}") from exc
 
 
-@st.cache_data(ttl=15)
-def fetch_overview() -> Dict[str, Any]:
-    return fetch_json("/overview", mock_overview_data())
+def trigger_cleaning(batch_id: str) -> Dict[str, Any]:
+    return call_json("POST", f"{CLEANING_BASE_URL}/api/clean/{batch_id}", timeout=90)
 
 
-@st.cache_data(ttl=15)
-def fetch_emotions() -> Dict[str, Any]:
-    return fetch_json("/emotions", mock_emotions_data())
+def fetch_cleaning_stats(batch_id: str) -> Dict[str, Any]:
+    return call_json("GET", f"{CLEANING_BASE_URL}/api/clean/stats/{batch_id}")
 
 
-@st.cache_data(ttl=15)
-def fetch_posts() -> Dict[str, Any]:
-    return fetch_json("/posts", mock_posts_data())
+def trigger_model(batch_id: str) -> Dict[str, Any]:
+    return call_json("POST", f"{MODEL_BASE_URL}/api/analyze/{batch_id}", timeout=30)
 
 
-def render_overview_hero(overview: Dict[str, Any]) -> None:
-    total_posts = int(overview.get("total_posts", 0))
-    platform_split = overview.get("platform_split", {}) or {"reddit": 0}
-    reddit_count = int(platform_split.get("reddit", 0))
-    date_range = overview.get("date_range", {})
-    start_date = date_range.get("start", "n/a")
-    end_date = date_range.get("end", "n/a")
+def fetch_model_stats(batch_id: str) -> Dict[str, Any]:
+    return call_json("GET", f"{MODEL_BASE_URL}/api/batch/{batch_id}")
+
+
+def fetch_model_results(batch_id: str) -> Dict[str, Any]:
+    return call_json("GET", f"{MODEL_BASE_URL}/results/{batch_id}")
+
+
+def poll_model_completion(batch_id: str, max_checks: int = 20, sleep_secs: int = 2) -> Dict[str, Any]:
+    latest: Dict[str, Any] = {}
+    for _ in range(max_checks):
+        latest = fetch_model_stats(batch_id)
+        pending = int(latest.get("pending", 0))
+        total_posts = int(latest.get("total_posts", 0))
+        if total_posts > 0 and pending == 0:
+            return latest
+        time.sleep(sleep_secs)
+    return latest
+
+
+def fetch_pipeline_rows(batch_id: str) -> List[Dict[str, Any]]:
+    return db_fetch_all(
+        """
+        SELECT
+            rp.id AS raw_post_id,
+            rp.raw_text,
+            rp.keyword,
+            cp.cleaned_text,
+            cp.language,
+            ep.emotion_label,
+            ep.confidence,
+            ep.analyzed_at
+        FROM raw_posts rp
+        LEFT JOIN cleaned_posts cp
+            ON cp.raw_post_id = rp.id
+           AND cp.batch_id = %s
+        LEFT JOIN enriched_posts ep
+            ON ep.cleaned_post_id = cp.id
+           AND ep.batch_id = %s
+        WHERE rp.batch_id = %s
+        ORDER BY rp.id DESC
+        """,
+        (batch_id, batch_id, batch_id),
+    )
+
+
+def shorten(text: str, max_chars: int) -> str:
+    value = (text or "").strip()
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 3].rstrip() + "..."
+
+
+def safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def render_hero(rows: List[Dict[str, Any]], batch_id: str) -> None:
+    total = len(rows)
+    analyzed = sum(1 for r in rows if r.get("emotion_label"))
+    pending = total - analyzed
 
     st.markdown(
         f"""
         <section class="hero-shell">
-            <div class="hero-topline">Dashboard</div>
-            <h1 class="hero-title">Neural Emotion Pipeline Live</h1>
-            <p class="hero-sub">Realtime view of Reddit ingestion, cleaning, and transformer-based emotion enrichment.</p>
-
+            <div class="hero-topline">System Status // Frontend Orchestrator</div>
+            <h1 class="hero-title">Keyword to Emotion Pipeline Control</h1>
+            <p class="hero-sub">Search raw_posts, assign a shared batch ID, trigger cleaning then model analysis, and inspect enriched output in one flow.</p>
             <div class="status-grid">
                 <div class="status-chip">
-                    <div class="chip-label">Total Posts Analyzed</div>
-                    <div class="chip-value">{total_posts:,}</div>
+                    <div class="chip-label">Active Batch</div>
+                    <div class="chip-value mono">{html.escape(batch_id or 'none')}</div>
                 </div>
                 <div class="status-chip">
-                    <div class="chip-label">Primary Platform</div>
-                    <div class="chip-platform"><span class="dot"></span>Reddit ({reddit_count:,})</div>
+                    <div class="chip-label">Total Posts In Batch</div>
+                    <div class="chip-value">{total}</div>
                 </div>
                 <div class="status-chip">
-                    <div class="chip-label">Coverage Window</div>
-                    <div class="chip-value">{start_date} to {end_date}</div>
+                    <div class="chip-label">Analyzed</div>
+                    <div class="chip-value">{analyzed}</div>
+                </div>
+                <div class="status-chip">
+                    <div class="chip-label">Pending</div>
+                    <div class="chip-value">{pending}</div>
                 </div>
             </div>
         </section>
@@ -455,201 +424,270 @@ def render_overview_hero(overview: Dict[str, Any]) -> None:
     )
 
 
-def build_emotion_chart(distribution: Dict[str, int]) -> go.Figure:
-    labels = []
-    values = []
-    colors = []
+def build_emotion_chart(rows: List[Dict[str, Any]]) -> go.Figure:
+    counts = {emotion: 0 for emotion in EMOTION_COLORS}
+    for row in rows:
+        emotion = str(row.get("emotion_label") or "").lower()
+        if emotion in counts:
+            counts[emotion] += 1
 
-    for emotion in EMOTION_COLORS:
-        labels.append(emotion.capitalize())
-        values.append(int(distribution.get(emotion, 0)))
-        colors.append(EMOTION_COLORS[emotion])
+    labels = [name.capitalize() for name in EMOTION_COLORS]
+    values = [counts[name] for name in EMOTION_COLORS]
+    colors = [EMOTION_COLORS[name] for name in EMOTION_COLORS]
 
     fig = go.Figure(
         data=[
             go.Pie(
                 labels=labels,
                 values=values,
-                hole=0.64,
+                hole=0.62,
                 marker={"colors": colors, "line": {"color": "#0a1222", "width": 2}},
                 textinfo="label+percent",
-                textfont={"size": 12, "color": "#e7eeff"},
-                hovertemplate="<b>%{label}</b><br>Posts: %{value}<br>Share: %{percent}<extra></extra>",
+                hovertemplate="<b>%{label}</b><br>Posts: %{value}<extra></extra>",
             )
         ]
     )
-
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        margin={"l": 0, "r": 0, "t": 4, "b": 4},
-        legend={
-            "orientation": "h",
-            "yanchor": "bottom",
-            "y": -0.14,
-            "xanchor": "center",
-            "x": 0.5,
-            "font": {"color": "#b8caef", "size": 11},
-        },
+        margin={"l": 0, "r": 0, "t": 8, "b": 10},
+        legend={"orientation": "h", "y": -0.15, "x": 0.5, "xanchor": "center", "font": {"size": 11}},
     )
     return fig
 
 
-def shorten(text: str, max_chars: int = 170) -> str:
-    text = text.strip()
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 3].rstrip() + "..."
-
-
-def render_post_explorer(posts: List[Dict[str, Any]]) -> None:
+def render_explorer(rows: List[Dict[str, Any]]) -> None:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown('<h3 class="panel-title">Enriched Post Explorer</h3>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="panel-subtitle">Search, filter by emotion label, and inspect confidence signals from the classifier.</p>',
+        '<p class="panel-subtitle">Joined view from raw_posts + cleaned_posts + enriched_posts for the selected batch.</p>',
         unsafe_allow_html=True,
     )
 
-    if not posts:
-        st.warning("No posts available from API or mock payload.")
+    if not rows:
+        st.info("No rows for this batch yet. Assign keyword batch first, then run cleaning/model.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    df = pd.DataFrame(posts)
-    for col in ["raw_text", "cleaned_text", "emotion_label", "confidence"]:
-        if col not in df.columns:
-            df[col] = "" if col != "confidence" else 0.0
-
-    left, middle, right = st.columns([2.6, 1.5, 1.4])
+    df = pd.DataFrame(rows)
+    left, mid, right = st.columns([2.4, 1.3, 1.3])
     with left:
-        query = st.text_input("Search posts", placeholder="Try: internship, layoffs, policy, update")
-    with middle:
-        emotions = ["all"] + [emotion for emotion in EMOTION_COLORS.keys()]
-        selected_emotion = st.selectbox("Emotion filter", emotions, index=0)
+        q = st.text_input("Search in post text", placeholder="Try: climate, renewable, policy")
+    with mid:
+        emotion_filter = st.selectbox("Emotion filter", ["all"] + list(EMOTION_COLORS.keys()))
     with right:
-        min_conf = st.slider("Min confidence", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
+        min_conf = st.slider("Min confidence", 0.0, 1.0, 0.0, 0.01)
 
     filtered = df.copy()
-    if query:
-        q = query.lower().strip()
+    if q:
+        needle = q.lower().strip()
         filtered = filtered[
-            filtered["raw_text"].str.lower().str.contains(q, na=False)
-            | filtered["cleaned_text"].str.lower().str.contains(q, na=False)
+            filtered["raw_text"].fillna("").str.lower().str.contains(needle)
+            | filtered["cleaned_text"].fillna("").str.lower().str.contains(needle)
         ]
 
-    if selected_emotion != "all":
-        filtered = filtered[filtered["emotion_label"].str.lower() == selected_emotion]
+    if emotion_filter != "all":
+        filtered = filtered[filtered["emotion_label"].fillna("").str.lower() == emotion_filter]
 
     filtered["confidence"] = pd.to_numeric(filtered["confidence"], errors="coerce").fillna(0.0)
-    filtered = filtered[filtered["confidence"] >= min_conf].sort_values(by="confidence", ascending=False)
+    filtered = filtered[filtered["confidence"] >= min_conf].sort_values(by="raw_post_id", ascending=False)
 
-    st.caption(f"Showing {len(filtered)} of {len(df)} posts")
+    st.caption(f"Showing {len(filtered)} of {len(df)} rows")
 
-    table_rows: List[str] = []
+    html_rows: List[str] = []
     for _, row in filtered.iterrows():
-        raw_text = html.escape(shorten(str(row.get("raw_text", "")), 190))
-        cleaned_text = html.escape(shorten(str(row.get("cleaned_text", "")), 170))
-        emotion = str(row.get("emotion_label", "neutral")).lower().strip() or "neutral"
-        color = EMOTION_COLORS.get(emotion, "#8D99AE")
-        confidence_pct = max(0.0, min(100.0, float(row.get("confidence", 0.0)) * 100))
+        raw_text = html.escape(shorten(str(row.get("raw_text") or ""), 180))
+        cleaned_text = html.escape(shorten(str(row.get("cleaned_text") or ""), 160))
+        emotion = str(row.get("emotion_label") or "pending").lower()
+        color = EMOTION_COLORS.get(emotion, "#7F8EA9")
+        conf_pct = safe_float(row.get("confidence")) * 100
+        keyword = html.escape(str(row.get("keyword") or ""))
 
-        table_rows.append(
+        html_rows.append(
             f"""
             <tr>
-                <td><div class="post-snippet">{raw_text}</div></td>
-                <td><div class="cleaned-snippet">{cleaned_text}</div></td>
-                <td><span class="emotion-pill" style="background:{color};">{html.escape(emotion)}</span></td>
+                <td>{raw_text}</td>
+                <td>{cleaned_text}</td>
+                <td><span class=\"emotion-pill\" style=\"background:{color};\">{html.escape(emotion)}</span></td>
                 <td>
-                    <div class="conf-wrap">
-                        <div class="conf-track">
-                            <div class="conf-fill" style="width:{confidence_pct:.1f}%; background: linear-gradient(90deg, {color}, #00f5ff);"></div>
-                        </div>
-                        <div class="conf-label">{confidence_pct:.1f}%</div>
-                    </div>
+                    <div class=\"conf-track\"><div class=\"conf-fill\" style=\"width:{conf_pct:.1f}%; background:linear-gradient(90deg,{color},#00f5ff);\"></div></div>
+                    <div>{conf_pct:.1f}%</div>
                 </td>
+                <td>{keyword}</td>
             </tr>
             """
         )
 
-    if not table_rows:
-        st.info("No rows match the active filters.")
-    else:
+    if html_rows:
         st.markdown(
             f"""
             <div class="table-shell">
-                <table class="post-table">
-                    <thead>
-                        <tr>
-                            <th>Original Reddit Post</th>
-                            <th>Cleaned Text</th>
-                            <th>Emotion Tag</th>
-                            <th>Confidence Score</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {''.join(table_rows)}
-                    </tbody>
-                </table>
+              <table class="post-table">
+                <thead>
+                  <tr>
+                    <th>Original Reddit Post</th>
+                    <th>Cleaned Text</th>
+                    <th>Emotion Tag</th>
+                    <th>Confidence</th>
+                    <th>Keyword</th>
+                  </tr>
+                </thead>
+                <tbody>{''.join(html_rows)}</tbody>
+              </table>
             </div>
             """,
             unsafe_allow_html=True,
         )
+    else:
+        st.warning("No rows match current filters.")
 
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def show_service_bar() -> None:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown('<h3 class="panel-title">Service Configuration</h3>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="small-note">API source: <strong>{}</strong>. If endpoints are unavailable, mock payloads are automatically used.</div>'.format(
-            API_BASE_URL
-        ),
+        f"""
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.7rem;">
+          <div><strong>Cleaning API</strong><br><span class="mono">{html.escape(CLEANING_BASE_URL)}</span></div>
+          <div><strong>Model API</strong><br><span class="mono">{html.escape(MODEL_BASE_URL)}</span></div>
+          <div><strong>Database</strong><br><span class="mono">{html.escape(normalize_database_url(DATABASE_URL))}</span></div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def init_state() -> None:
+    st.session_state.setdefault("active_batch_id", "")
+    st.session_state.setdefault("last_keyword", "")
+    st.session_state.setdefault("last_clean_stats", {})
+    st.session_state.setdefault("last_model_stats", {})
+
+
 def main() -> None:
     inject_custom_css()
+    init_state()
 
-    overview_payload = fetch_overview()
-    emotion_payload = fetch_emotions()
-    posts_payload = fetch_posts()
+    show_service_bar()
 
-    render_overview_hero(overview_payload)
+    control_col, action_col = st.columns([1.8, 1.2], gap="large")
 
-    chart_col, legend_col = st.columns([2.0, 1.0], gap="large")
+    with control_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<h3 class="panel-title">Step 1: Keyword Search and Batch Assignment</h3>', unsafe_allow_html=True)
+        keyword = st.text_input("Keyword", value=st.session_state["last_keyword"], placeholder="Enter keyword to find in raw_posts")
+        limit = st.number_input("Max posts to include in batch", min_value=1, max_value=200, value=50, step=1)
+
+        if st.button("Assign New Batch From Keyword", type="primary", use_container_width=True):
+            try:
+                if not keyword.strip():
+                    raise PipelineError("Keyword cannot be empty.")
+                with st.spinner("Searching raw_posts and assigning new batch_id..."):
+                    result = search_and_assign_batch(keyword.strip(), int(limit))
+                st.session_state["active_batch_id"] = result.batch_id
+                st.session_state["last_keyword"] = keyword.strip()
+                st.success(f"Batch assigned: {result.batch_id} ({result.matched_count} posts)")
+                if result.sample_rows:
+                    st.dataframe(pd.DataFrame(result.sample_rows), use_container_width=True, hide_index=True)
+            except Exception as exc:
+                st.error(str(exc))
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with action_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<h3 class="panel-title">Step 2/3: Trigger Services</h3>', unsafe_allow_html=True)
+
+        active_batch_id = st.session_state.get("active_batch_id", "")
+        st.markdown(f"Active batch: <span class='mono'>{html.escape(active_batch_id or 'none')}</span>", unsafe_allow_html=True)
+
+        disable_actions = not active_batch_id
+
+        if st.button("Trigger Cleaning", use_container_width=True, disabled=disable_actions):
+            try:
+                with st.spinner("Calling cleaning service..."):
+                    payload = trigger_cleaning(active_batch_id)
+                st.success(f"Cleaning done. Processed: {payload.get('total_processed', 0)}")
+                st.session_state["last_clean_stats"] = fetch_cleaning_stats(active_batch_id)
+            except Exception as exc:
+                st.error(str(exc))
+
+        if st.button("Trigger Model", use_container_width=True, disabled=disable_actions):
+            try:
+                with st.spinner("Queuing model analysis and polling completion..."):
+                    trigger_model(active_batch_id)
+                    st.session_state["last_model_stats"] = poll_model_completion(active_batch_id)
+                st.success("Model analysis completed or reached polling timeout.")
+            except Exception as exc:
+                st.error(str(exc))
+
+        if st.button("Run Full Pipeline", use_container_width=True, disabled=disable_actions):
+            try:
+                with st.spinner("Running cleaning then model..."):
+                    trigger_cleaning(active_batch_id)
+                    st.session_state["last_clean_stats"] = fetch_cleaning_stats(active_batch_id)
+                    trigger_model(active_batch_id)
+                    st.session_state["last_model_stats"] = poll_model_completion(active_batch_id)
+                st.success("Full pipeline run finished.")
+            except Exception as exc:
+                st.error(str(exc))
+
+        if st.button("Refresh Batch Status", use_container_width=True, disabled=disable_actions):
+            try:
+                st.session_state["last_clean_stats"] = fetch_cleaning_stats(active_batch_id)
+            except Exception as exc:
+                st.warning(f"Cleaning stats unavailable: {exc}")
+            try:
+                st.session_state["last_model_stats"] = fetch_model_stats(active_batch_id)
+            except Exception as exc:
+                st.warning(f"Model stats unavailable: {exc}")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    active_batch_id = st.session_state.get("active_batch_id", "")
+    rows: List[Dict[str, Any]] = []
+    if active_batch_id:
+        try:
+            rows = fetch_pipeline_rows(active_batch_id)
+        except Exception as exc:
+            st.error(f"Failed to load pipeline data from DB: {exc}")
+
+    render_hero(rows, active_batch_id)
+
+    metrics_col, chart_col = st.columns([1, 2], gap="large")
+    with metrics_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<h3 class="panel-title">Batch Progress</h3>', unsafe_allow_html=True)
+
+        clean_stats = st.session_state.get("last_clean_stats", {})
+        model_stats = st.session_state.get("last_model_stats", {})
+
+        st.write("Cleaning stats")
+        st.json(clean_stats or {"info": "No cleaning stats yet"})
+
+        st.write("Model stats")
+        st.json(model_stats or {"info": "No model stats yet"})
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
     with chart_col:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.markdown('<h3 class="panel-title">Emotion Distribution Visualizer</h3>', unsafe_allow_html=True)
-        st.markdown(
-            '<p class="panel-subtitle">Transformer inference classes across enriched Reddit posts.</p>',
-            unsafe_allow_html=True,
-        )
-        distribution = emotion_payload.get("distribution", {})
-        fig = build_emotion_chart(distribution)
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.markdown('<h3 class="panel-title">Emotion Distribution</h3>', unsafe_allow_html=True)
+        st.markdown('<p class="panel-subtitle">Distribution in enriched_posts for active batch.</p>', unsafe_allow_html=True)
+        st.plotly_chart(build_emotion_chart(rows), use_container_width=True, config={"displayModeBar": False})
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with legend_col:
-        st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.markdown('<h3 class="panel-title">Class Map</h3>', unsafe_allow_html=True)
-        st.markdown('<p class="panel-subtitle">Color coding used in chart and table badges.</p>', unsafe_allow_html=True)
+    render_explorer(rows)
 
-        for emotion, color in EMOTION_COLORS.items():
-            count = int(distribution.get(emotion, 0))
-            st.markdown(
-                f"""
-                <div style="display:flex;align-items:center;justify-content:space-between;padding:0.45rem 0.1rem;border-bottom:1px solid rgba(141,153,174,0.14);">
-                    <div style="display:flex;align-items:center;gap:0.55rem;">
-                        <span style="display:inline-block;width:11px;height:11px;border-radius:50%;background:{color};box-shadow:0 0 10px {color};"></span>
-                        <span style="color:#e9f0ff;text-transform:capitalize;">{emotion}</span>
-                    </div>
-                    <span style="color:#9ab0dd;font-weight:600;">{count}</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    posts_list = posts_payload.get("posts", []) if isinstance(posts_payload, dict) else []
-    render_post_explorer(posts_list)
+    if active_batch_id and st.button("Fetch Results API Payload", use_container_width=True):
+        try:
+            payload = fetch_model_results(active_batch_id)
+            st.json(payload)
+        except Exception as exc:
+            st.error(f"Failed to fetch /results payload: {exc}")
 
 
 if __name__ == "__main__":

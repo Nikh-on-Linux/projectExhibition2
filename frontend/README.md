@@ -1,88 +1,60 @@
 # Frontend Dashboard (Streamlit)
 
-Neon-styled dark mode dashboard for the Reddit emotion analysis pipeline.
+Neon-styled dark mode dashboard that now acts as the full pipeline controller.
+
+## What This Frontend Does
+
+The UI now performs end-to-end orchestration:
+
+1. Enter keyword in UI.
+2. Search matching rows in `raw_posts` (keyword or raw_text match).
+3. Assign a new common `batch_id` to those rows.
+4. Trigger cleaning service (`POST /api/clean/{batch_id}`).
+5. Trigger model service (`POST /api/analyze/{batch_id}`).
+6. Poll batch progress and render final joined output.
 
 ## Features
 
-- System Status hero section (not generic KPI cards)
-- Donut chart for the 7 emotion classes
-- Interactive post explorer with:
-	- text search
-	- emotion filter dropdown
-	- confidence threshold slider
-	- emotion color badges and confidence bars
-- API-first data loading with mock fallbacks if backend endpoints are not ready
+- Pipeline control panel (assign batch + trigger cleaning + trigger model)
+- Hero section showing active batch and processing counts
+- Donut chart for 7 emotions: joy, anger, fear, disgust, sadness, surprise, neutral
+- Interactive explorer with:
+	- search
+	- emotion filter
+	- confidence filter
+	- emotion badges and confidence bars
+- Live joined view from `raw_posts`, `cleaned_posts`, and `enriched_posts`
 
-## API Endpoints
+## Required Services
 
-The app fetches from `http://localhost:8000` (configurable via `DASHBOARD_API_URL`):
+- Cleaning service running (default: `http://localhost:5000`)
+- Model service running (default: `http://localhost:4000`)
+- PostgreSQL with project tables populated
 
-- `GET /overview`
-- `GET /emotions`
-- `GET /posts`
+## Environment Variables
 
-If these endpoints are unreachable or return invalid payloads, the app uses realistic mock responses.
+Set these before running Streamlit (optional if defaults work):
+
+- `CLEANING_BASE_URL` (default: `http://localhost:5000`)
+- `MODEL_BASE_URL` (default: `http://localhost:4000`)
+- `DATABASE_URL` (default: `postgresql://emotion_app:emotion_password_123@localhost:5432/emotion_db`)
+
+Note: If your existing env uses SQLAlchemy async format (`postgresql+asyncpg://...`), this frontend auto-normalizes it to psycopg format.
 
 ## Quick Start
 
-1. Create and activate a virtual environment (recommended).
-2. Install dependencies:
-
 ```bash
 pip install -r requirements.txt
+streamlit run app.py --server.port 8000
 ```
 
-3. Run app (configured on port 8000):
+## Expected Backend Endpoints
 
-```bash
-streamlit run app.py
-```
+Cleaning service:
+- `POST /api/clean/{batch_id}`
+- `GET /api/clean/stats/{batch_id}`
 
-4. Optional: override API base URL:
-
-```bash
-set DASHBOARD_API_URL=http://localhost:8000
-streamlit run app.py
-```
-
-## Data Shape Expected
-
-### `/overview`
-```json
-{
-	"total_posts": 1842,
-	"platform_split": {"reddit": 1842},
-	"date_range": {"start": "2026-02-27", "end": "2026-03-28"}
-}
-```
-
-### `/emotions`
-```json
-{
-	"distribution": {
-		"joy": 372,
-		"anger": 214,
-		"fear": 177,
-		"disgust": 122,
-		"sadness": 313,
-		"surprise": 198,
-		"neutral": 446
-	}
-}
-```
-
-### `/posts`
-```json
-{
-	"posts": [
-		{
-			"raw_text": "...",
-			"cleaned_text": "...",
-			"emotion_label": "joy",
-			"confidence": 0.94,
-			"platform": "reddit",
-			"created_at": "2026-03-28T15:41:00"
-		}
-	]
-}
-```
+Model service:
+- `POST /api/analyze/{batch_id}`
+- `GET /api/batch/{batch_id}`
+- `GET /results/{batch_id}`
